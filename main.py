@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from datetime import datetime
 from model import LDPCNetwork
 from data import CustomDataset, init_parameter, create_random_samples, read_uncor_sample
+import pdb
 
 # Global samples if sampling_type='Read'
 GLOBAL_TRAIN_SAMPLES = None
@@ -24,9 +25,9 @@ def save_model_weights(net, args, current_time, best):
     """Example: save learned weights to a text file (optional)."""
     os.makedirs("./Weights", exist_ok=True)
     if best == True:
-        path = f"./Weights/{args.decoding_type}_{args.filename}_Opt_Weight_Iter{args.iters_max}.txt"
+        path = f"./Weights/{args.decoding_type}_{args.sharing}_{args.loss_option}_{args.loss_function}_{args.filename}_Opt_Weight_Iter{args.iters_max}.txt"
     else:
-        path = f"./Weights/{args.decoding_type}_{args.filename}_Weight_Iter{args.iters_max}.txt"
+        path = f"./Weights/{args.decoding_type}_{args.sharing}_{args.loss_option}_{args.loss_function}_{args.filename}_Weight_Iter{args.iters_max}.txt"
 
     with open(path, "w") as f:
         f.write("\t".join(map(str, args.sharing)) + "\n\n")
@@ -36,7 +37,8 @@ def save_model_weights(net, args, current_time, best):
 
 def _write_weight(f, w_param, name_str):
     if w_param is None:
-        f.write(f"{name_str}: None\n\n")
+        #f.write(f"{name_str}: None\n\n")
+        f.write(f"None\n\n")
         return
     arr = w_param.detach().cpu().numpy()
     f.write(f"{name_str}:\n")
@@ -48,6 +50,7 @@ def _write_weight(f, w_param, name_str):
             line = "\t".join(f"{x:.6f}" for x in row)
             f.write(line + "\n")
         f.write("\n")
+
 
 def run_validation(args, net, code_param, device, rng, epoch):
     """
@@ -78,7 +81,7 @@ def run_validation(args, net, code_param, device, rng, epoch):
         return 0.0
 
     ds_val = CustomDataset(llrs_valid)
-    loader_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False)
+    loader_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
     total_loss = 0.0
     total_count = 0
@@ -112,20 +115,20 @@ def run_validation(args, net, code_param, device, rng, epoch):
 
     avg_loss = total_loss / total_count if total_count else 0.0
     elapsed  = time.time() - start_time
-    logging.info(f"[Epoch {epoch}] valid loss={avg_loss:.4f}, valid time={elapsed:.2f}s")
+    logging.info(f"[Epoch {epoch}] valid loss {avg_loss:.4f}, valid time {elapsed:.2f}s")
 
     # Print SNR-based stats
     for i, snr_val in enumerate(args.SNR_array):
         if samp_snr[i] == 0:
-            logging.info(f"SNR={snr_val:.3f} BER=0.00 FER=0.00")
+            logging.info(f"SNR {snr_val:.3f} BER 0.00 FER 0.00")
             continue
         ber = bit_err_snr[i]/ bit_snr[i]
         fer = frm_err_snr[i]/ samp_snr[i]
-        logging.info(f"SNR={snr_val:.3f} BER={ber:.2e} FER={fer:.2e}")
+        logging.info(f"SNR {snr_val:.3f} BER {ber:.2e} FER {fer:.2e}") 
 
     return avg_loss
 
-def run_training(args, net, code_param, device, rng, epoch):
+def run_training(args, net, code_param, device, rng, epoch, q_bit):
     """
     Training step.
     Measures time, logs train_loss to both console and file.
@@ -153,7 +156,7 @@ def run_training(args, net, code_param, device, rng, epoch):
         return 0.0
 
     ds_train = CustomDataset(llrs_train)
-    loader_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True)
+    loader_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=False, drop_last=True)
     optimizer = torch.optim.Adam(net.parameters(), lr=args.learn_rate)
 
     total_loss = 0.0
@@ -193,7 +196,7 @@ def setup_environment(args):
 
     # Generate current time string for unique perf_path
     current_time = datetime.now().strftime("%m%d_%H%M%S")
-    perf_path = f"./Weights/{args.decoding_type}_{args.filename}_Performance.txt"
+    perf_path = f"./Weights/{args.decoding_type}_{args.sharing}_{args.loss_option}_{args.loss_function}_{args.filename}_Performance_Iter_{args.iters_max}.txt"
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -202,16 +205,16 @@ def setup_environment(args):
             logging.FileHandler(perf_path, mode='w')
         ]
     )
-    logging.info("<----------Arguments---------->")
+    logging.info("<------------- Arguments ------------->")
     for k, v in vars(args).items():
         logging.info(f"{k}={v}")
-    logging.info("-------------------------------")
     logging.info("")
 
     # Prepare device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     logging.info(f"Device: {device}")
-
+    logging.info("<========================================>")
+    logging.info("")
     # Initialize RNG
     rng = np.random.RandomState(args.seed_in)
 
@@ -221,7 +224,7 @@ def main(args):
     # Setup environment
     current_time, rng, device = setup_environment(args)
 
-    code_param = init_parameter(args.filename, args.z_factor, args.cn_mode)
+    code_param = init_parameter(args.filename, args.z_factor, args.cn_mode, args.q_bit)
 
     # If sampling_type=1, load global samples from file once
     if args.sampling_type == 'Read':
@@ -242,7 +245,7 @@ def main(args):
     # Main epoch loop
     for epoch in range(1, args.epoch_input + 1):
         val_loss   = run_validation(args, net, code_param, device, rng, epoch)
-        train_loss = run_training(args, net, code_param, device, rng, epoch)
+        train_loss = run_training(args, net, code_param, device, rng, epoch, args.q_bit)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -261,11 +264,12 @@ if __name__ == "__main__":
     parser.add_argument('--filename', type=str, default='wman_N0576_R34_z24')
     parser.add_argument('--z_factor', type=int, default=24)
     parser.add_argument('--clip_llr', type=float, default=20)
-    parser.add_argument('--decoding_type', type=str, default='MS', choices=['SP','MS'])
-    parser.add_argument('--sharing', nargs='+', type=int, default=[3,0,3]) #[cn_weight,ucn_weight,ch_weight], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
+    parser.add_argument('--decoding_type', type=str, default='MS', choices=['SP','MS', 'QMS'])
+    parser.add_argument('--sharing', nargs='+', type=int, default=[1,0,2]) #[cn_weight,ucn_weight,ch_weight], 1: Edges/Iters 2: Node/Iter 3: Iter, 4: Edge, 5: Node
     parser.add_argument('--iters_max', type=int, default=20)
     parser.add_argument('--fixed_iter', type=int, default=0)
     parser.add_argument('--systematic', type=str, default='off', choices=['off', 'on'])
+    parser.add_argument('--q_bit', type=int, default=5) # QMS
 
     parser.add_argument('--init_cn_weight', type=int, default=1)
     parser.add_argument('--init_ch_weight', type=int, default=1)
@@ -275,15 +279,15 @@ if __name__ == "__main__":
                         choices=['sequential', 'parallel'],
                         help='Choose the CN update mode: sequential or parallel') 
 
-    parser.add_argument('--loss_option', type=str, default='last', choices = ['multi', 'last'])
+    parser.add_argument('--loss_option', type=str, default='multi', choices = ['multi', 'last'])
     parser.add_argument('--loss_function', type=str, default='FER', choices=['BCE', 'Soft_BER', 'FER'])    
 
     parser.add_argument('--sampling_type', type=str, default='Random',choices=['Random','Read','Collect']) #'Collect"is not yet implemented.
     parser.add_argument('--SNR_array', nargs='+', type=float, 
-                        default=[2,2.5,3.0,3.5,4.0])
+                        default=[1, 2, 3, 4, 5, 6, 7, 8])
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--training_num', type=int, default=10000)
-    parser.add_argument('--valid_num', type=int, default=10000)
+    parser.add_argument('--valid_num', type=int, default=80000)
     parser.add_argument('--epoch_input', type=int, default=100)
     parser.add_argument('--learn_rate', type=float, default=1e-3)
     parser.add_argument('--seed_in', type=int, default=42)
