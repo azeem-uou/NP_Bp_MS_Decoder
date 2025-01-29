@@ -21,6 +21,9 @@ class LDPCNetwork(nn.Module):
         self.M = code_param.M
         self.E = code_param.E
         self.z_factor = code_param.z_value
+        
+        # Add quant_step as an attribute
+        self.quant_step = code_param.quant_step
 
         # Basic index arrays (on GPU)
         self.h_matrix   = torch.from_numpy(code_param.h_matrix).float().to(self.device)
@@ -111,16 +114,21 @@ class LDPCNetwork(nn.Module):
             v2c_llr = self._vn_update(w_ch, c2v_llr, sum_llr)
 
             # CN update (SP or MS), either parallel or sequential
-            if self.decoding_type == 'SP':  # SP
-                if self.cn_mode == 'parallel':
-                    c2v_unweighted = self._cn_update_SP_par(v2c_llr)
-                else:
-                    c2v_unweighted = self._cn_update_SP_seq(v2c_llr)
-            else:  # MS
+            if self.decoding_type == 'SP':  # Sum-Product
+                    if self.cn_mode == 'parallel':
+                        c2v_unweighted = self._cn_update_SP_par(v2c_llr)
+                    else:
+                        c2v_unweighted = self._cn_update_SP_seq(v2c_llr)
+            elif self.decoding_type == 'MS':  # Min-Sum
                 if self.cn_mode == 'parallel':
                     c2v_unweighted = self._cn_update_MS_par(v2c_llr)
                 else:
                     c2v_unweighted = self._cn_update_MS_seq(v2c_llr)
+            elif self.decoding_type == 'QMS':  # Quantized Min-Sum
+                if self.cn_mode == 'parallel':
+                    c2v_unweighted = self._cn_update_QMS_par(v2c_llr)
+                else:
+                    c2v_unweighted = self._cn_update_QMS_seq(v2c_llr)
 
             # Optional CN weighting and sum of CN->VN messages
             c2v_llr = self._apply_cn_weight(c2v_unweighted, it, syndrome)
@@ -344,6 +352,103 @@ class LDPCNetwork(nn.Module):
 
         c2v_new = out
         return c2v_new
+    
+    def _cn_update_QMS_seq(self, v2c_llr):
+        """
+        Sequential QMS: loop over each CN, find quantized min1, min2, etc. (top-2 quantized min approach).
+        """
+        bsz = v2c_llr.size(0)
+        c2v_new = torch.zeros_like(v2c_llr)
+    
+    # Define quantization function
+        def quantize(val):
+            step = self.quant_step  # quantization step size
+            return torch.round(val / step) * step
+
+        for c in range(self.M):
+            edges_c = self.cn_to_edge[c]
+            if len(edges_c) == 0:
+                continue
+            vals = v2c_llr[:, edges_c]
+            absvals = torch.abs(vals)
+            sgnvals = torch.sign(vals)
+            tot_sign = torch.prod(
+                torch.where(sgnvals == 0, torch.ones_like(sgnvals), sgnvals),
+                dim=1
+            )
+
+            # Quantize absolute values
+            quant_absvals = quantize(absvals)
+
+            # top-2 quantized min
+            top2, idx2 = torch.topk(quant_absvals, 2, dim=1, largest=False)
+            mag1 = top2[:, 0]
+            mag2 = top2[:, 1]
+            pos = idx2[:, 0]  # argmin1
+            row_idx = torch.arange(vals.size(1), device=vals.device).unsqueeze(0).expand(bsz, -1)
+            mg = mag1.unsqueeze(1).expand(-1, vals.size(1)).clone()
+            mg[row_idx == pos.unsqueeze(1)] = mag2
+
+            # Quantize again after finding top-2 min values
+            mg = quantize(mg)
+
+            s_j = torch.where(vals < 0, -tot_sign.unsqueeze(1), tot_sign.unsqueeze(1))
+            out = torch.clamp(s_j * mg, -self.clip_llr, self.clip_llr)
+            c2v_new[:, edges_c] = out
+
+        return c2v_new
+    def _cn_update_QMS_par(self, v2c_llr):
+        """
+        Parallel QMS using [E, d_max-1]:
+        1) gather abs and sign from extrinsic edges
+        2) quantize values
+        3) min across dim=2, product of sign across dim=2
+        4) combine to form c2v_new
+        """
+        c2v_new = torch.zeros_like(v2c_llr)
+
+        ext_idx = self.edge_to_ext_edge  # [E, d_max-1]
+        absvals = v2c_llr.abs()
+        sgnvals = torch.sign(v2c_llr)
+
+        # Define quantization function
+        def quantize(val):
+            step = self.quant_step  # quantization step size
+            return torch.round(val / step) * step
+
+        # Quantize absolute values
+        absvals = quantize(absvals)
+
+        # Gather extrinsic abs -> [B, E, d_max-1]
+        extrinsic_abs = absvals[:, ext_idx]
+        big_val = absvals.new_tensor(1e9)  # Large value to mask invalid indices
+        mask_invalid = (ext_idx < 0)
+        extrinsic_abs = torch.where(
+            mask_invalid.unsqueeze(0),
+            big_val,
+            extrinsic_abs
+        )
+        min_abs = extrinsic_abs.min(dim=2).values  # => [B, E]
+
+        # Quantize minimum values
+        min_abs = quantize(min_abs)
+
+        # Gather extrinsic sign -> [B, E, d_max-1]
+        extrinsic_sgnvals = sgnvals[:, ext_idx]
+        extrinsic_sgnvals = torch.where(
+            mask_invalid.unsqueeze(0),
+            extrinsic_sgnvals.new_tensor(1.0),
+            extrinsic_sgnvals
+        )
+        sign_prod = torch.prod(extrinsic_sgnvals, dim=2)  # => [B, E]
+
+        # Compute output
+        out = min_abs * sign_prod
+        out = torch.clamp(out, -self.clip_llr, self.clip_llr)
+
+        c2v_new = out
+        return c2v_new
+
 
     def _compute_sum_llr(self, c2v_llr, sum_llr):
         """
@@ -431,7 +536,7 @@ class LDPCNetwork(nn.Module):
 
     def load_init_weights_from_file(net, args):
     
-        path = f"./Weights/{args.filename}_In_Weight_Iter{args.iters_max}.txt"
+        path = f"./Weights/{args.decoding_type}_{args.sharing}_{args.loss_option}_{args.loss_function}_{args.filename}_Weight_Iter{args.iters_max}.txt"
         if not os.path.exists(path):
             logging.warning(f"No init weight file: {path}. Using default init=1.")
             return
