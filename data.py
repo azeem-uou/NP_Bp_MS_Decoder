@@ -12,7 +12,7 @@ class CodeParam:
         cn_to_edge, vn_to_edge,
         edge_to_VN, edge_to_CN, edge_to_ext_edge,
         M_proto, N_proto, E_proto, 
-        z_value, proto_matrix
+        z_value, proto_matrix, q_bit, quant_step
     ):
         self.h_matrix = H
         self.N = N
@@ -32,6 +32,8 @@ class CodeParam:
         self.E_proto = E_proto
         self.z_value = z_value
         self.proto_matrix = proto_matrix
+        self.q_bit = q_bit
+        self.quant_step = quant_step  # Add this attribute
 
 class CustomDataset(Dataset):
     """Simple dataset containing only LLR samples."""
@@ -45,7 +47,7 @@ class CustomDataset(Dataset):
     def __len__(self):
         return len(self.llrs)
 
-def init_parameter(filename, z_factor, CN_mode):
+def init_parameter(filename, z_factor, CN_mode, q_bit):
     """
     Load proto-matrix and build full H. 
     Return a CodeParam object with edges, degrees, etc.
@@ -96,20 +98,21 @@ def init_parameter(filename, z_factor, CN_mode):
                 edge_to_CN[idx] = m_
                 idx += 1
 
-    # 미리 (E, d_max-1) 짜리 -1로 초기화
+    # Initialize to (E, d_max-1) -1 in advance
     edge_to_ext_edge = -1 * np.ones((E, cn_max_deg-1), dtype=np.int32)
 
     # 채우기
     for c in range(M):
-        edges_c = cn_to_edge[c]  # 이 CN에 연결된 edge들
+        edges_c = cn_to_edge[c]  # Edges connected to CN
         for e in edges_c:
-            # e 자신을 제외한 edge 목록
+            # e list of edges excluding itself
             others = [ex for ex in edges_c if ex != e]
-            # d_max-1 중 앞쪽만 실제 값, 남으면 -1로 둔다
+            # Only the front of d_max-1 is set to the actual value, and if it remains -1
             for i, e2 in enumerate(others):
                 edge_to_ext_edge[e, i] = e2
 
-    
+     # Set quantization step size for QMS
+    quant_step = 2 ** (-q_bit)  # Define the quantization granularity based on q_bit
     return CodeParam(
         H=H,
         N=N, M=M, E=E, code_rate=code_rate,
@@ -119,7 +122,9 @@ def init_parameter(filename, z_factor, CN_mode):
         edge_to_ext_edge = edge_to_ext_edge,
         M_proto=M_proto, N_proto=N_proto,
         E_proto=E_proto, z_value=z_factor,
-        proto_matrix=proto_mat
+        proto_matrix=proto_mat,
+        q_bit=q_bit,  # Store q_bit for later use
+        quant_step=quant_step  # Add quantization step size
     )
 
 def create_random_samples(sample_num, code_rate, SNR_array, rng, N):
